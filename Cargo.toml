@@ -1,0 +1,45 @@
+[package]
+name = "reth-light-sync"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# reth
+reth = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods", features = ["mdbx"] }
+reth-provider = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-staged-sync = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-stages = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-interfaces = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-network = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-downloaders = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth-executor = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+
+# tracing
+tracing = "0.1"
+
+# io
+fdlimit = "0.2.1"
+serde_json = "1.0"
+confy = "0.5"
+
+# misc
+eyre = "0.6.8"
+clap = { git = "https://github.com/rkrasiuk/clap", branch = "rkrasiuk/fix-almost-swapped-lint", features = ["derive", "cargo"] }
+tokio = { version = "1.21", features = ["sync", "macros", "rt-multi-thread"] }
+futures = "0.3.25"
+rayon = "1.6.0"
+
+[patch.crates-io]
+revm = { git = "https://github.com/bluealloy/revm" }
+revm-primitives = { git = "https://github.com/bluealloy/revm" }
+# patched for quantity U256 responses <https://github.com/recmo/uint/issues/224>
+ruint = { git = "https://github.com/paradigmxyz/uint" }
