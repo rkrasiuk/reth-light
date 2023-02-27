@@ -2,11 +2,12 @@ use crate::{
     db::{init_db, init_genesis},
     dirs::{HeadersDbPath, StateDbPath},
     state_sync::StateSync,
+    uploader::GithubUploader,
 };
 use clap::{crate_version, Parser};
 use eyre::Context;
 use fdlimit::raise_fd_limit;
-use futures::{pin_mut, StreamExt};
+use futures::{pin_mut, Future, StreamExt};
 use reth::{
     args::NetworkArgs,
     dirs::{ConfigPath, PlatformPath},
@@ -32,7 +33,7 @@ use reth_primitives::{ChainSpec, H256};
 use reth_provider::{BlockProvider, HeaderProvider, ShareableDatabase};
 use reth_staged_sync::{utils::chainspec::genesis_value_parser, Config};
 use reth_tasks::TaskExecutor;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::watch;
 use tracing::*;
 
@@ -118,7 +119,7 @@ impl Command {
             .build_state_sync(
                 &mut config,
                 network.clone(),
-                &consensus,
+                consensus,
                 headers_db,
                 state_db,
                 &ctx.task_executor,
@@ -132,27 +133,25 @@ impl Command {
 
         // Run sync
         let (rx, tx) = tokio::sync::oneshot::channel();
-        info!(target: "reth::cli", "Starting sync pipeline");
+        info!(target: "reth::cli", "Starting state sync");
         ctx.task_executor
-            .spawn_critical_blocking("pipeline task", async move {
+            .spawn_critical_blocking("state sync task", async move {
                 let res = state_sync.run().await;
                 let _ = rx.send(res);
             });
 
         tx.await??;
 
-        info!(target: "reth::cli", "Pipeline has finished.");
+        info!(target: "reth::cli", "State sync has finished.");
 
-        // The pipeline has finished downloading blocks up to `--debug.tip` or
-        // `--debug.max-block`. Keep other node components alive for further usage.
-        futures::future::pending().await
+        Ok(())
     }
 
     async fn build_state_sync(
         &self,
         config: &mut Config,
         network: NetworkHandle,
-        consensus: &Arc<dyn Consensus>,
+        consensus: Arc<dyn Consensus>,
         headers_db: Arc<Env<WriteMap>>,
         state_db: Arc<Env<WriteMap>>,
         task_executor: &TaskExecutor,
@@ -171,11 +170,14 @@ impl Command {
             )
             .into_task_with(task_executor);
 
+        let uploader = GithubUploader::new(self.state_db.clone().as_ref());
+
         Ok(StateSync::new(
             headers_db,
             state_db,
             header_downloader,
             body_downloader,
+            uploader,
             Arc::new(self.chain.clone()),
             self.tip,
         ))

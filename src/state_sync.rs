@@ -1,4 +1,4 @@
-use futures::{StreamExt, TryStreamExt};
+use futures::{future, StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
@@ -21,11 +21,14 @@ use reth_stages::stages::SyncGap;
 use std::sync::Arc;
 use tracing::*;
 
-pub struct StateSync<H: HeaderDownloader, B: BodyDownloader, DB: Database> {
+use crate::uploader::GithubUploader;
+
+pub struct StateSync<H, B, DB> {
     headers_db: DB,
     state_db: DB,
     header_downloader: H,
     body_downloader: B,
+    uploader: GithubUploader,
     chain_spec: Arc<ChainSpec>,
     tip: H256,
 }
@@ -36,6 +39,7 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
         state_db: DB,
         header_downloader: H,
         body_downloader: B,
+        uploader: GithubUploader,
         chain_spec: Arc<ChainSpec>,
         tip: H256,
     ) -> Self {
@@ -44,12 +48,13 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
             state_db,
             header_downloader,
             body_downloader,
+            uploader,
             chain_spec,
             tip,
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), eyre::Error> {
+    pub async fn run(&mut self) -> eyre::Result<()> {
         // Download headers
         let current_progress = 0; // TODO:
         let gap = self.get_sync_gap(current_progress).await?;
@@ -75,12 +80,13 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
         }
 
         // Download and execute bodies
+        let mut latest = 0;
         let mut td = self.chain_spec.genesis.difficulty;
         while let Some(bodies) = self.body_downloader.try_next().await? {
             tracing::trace!(target: "sync", len = bodies.len(), "Downloaded bodies");
             let blocks = bodies
                 .into_iter()
-                .map(|body| -> Result<_, eyre::Error> {
+                .map(|body| -> eyre::Result<_> {
                     td += body.header().difficulty;
                     let block = match body {
                         BlockResponse::Empty(header) => SealedBlock {
@@ -101,12 +107,13 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok((block, senders, td.clone()))
                 })
-                .collect::<Result<Vec<_>, eyre::Error>>()?;
+                .collect::<eyre::Result<Vec<_>>>()?;
 
             let (start, end) = (
                 blocks.first().unwrap().0.number,
                 blocks.last().unwrap().0.number,
             );
+            latest = end;
             tracing::trace!(target: "sync", start, end, "Executing blocks");
 
             let tx = self.state_db.tx_mut()?;
@@ -216,6 +223,8 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
             }
         }
 
+        self.uploader.upload_state(latest).await?;
+
         Ok(())
     }
 
@@ -226,7 +235,7 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
         changeset: AccountInfoChangeSet,
         address: Address,
         has_state_clear_eip: bool,
-    ) -> Result<(), eyre::Error> {
+    ) -> eyre::Result<()> {
         match changeset {
             AccountInfoChangeSet::Changed { new, .. } => {
                 tx.put::<tables::PlainAccountState>(address, new)?;
@@ -248,7 +257,7 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
     /// Get the head and tip of the range we need to sync
     ///
     /// See also [SyncTarget]
-    async fn get_sync_gap(&self, stage_progress: u64) -> Result<SyncGap, eyre::Error> {
+    async fn get_sync_gap(&self, stage_progress: u64) -> eyre::Result<SyncGap> {
         let tx = self.headers_db.tx()?;
 
         // Create a cursor over canonical header hashes
@@ -272,14 +281,12 @@ impl<H: HeaderDownloader, B: BodyDownloader, DB: Database> StateSync<H, B, DB> {
         // Look up the next header
         let next_header = cursor
             .next()?
-            .map(
-                |(next_num, next_hash)| -> Result<SealedHeader, eyre::Error> {
-                    let (_, next) = header_cursor
-                        .seek_exact(next_num)?
-                        .ok_or(ProviderError::Header { number: next_num })?;
-                    Ok(next.seal(next_hash))
-                },
-            )
+            .map(|(next_num, next_hash)| -> eyre::Result<SealedHeader> {
+                let (_, next) = header_cursor
+                    .seek_exact(next_num)?
+                    .ok_or(ProviderError::Header { number: next_num })?;
+                Ok(next.seal(next_hash))
+            })
             .transpose()?;
 
         // Decide the tip or error out on invalid input.

@@ -5,6 +5,7 @@ use reth::{
 };
 
 pub fn run() -> eyre::Result<()> {
+    dotenv::dotenv().ok();
     let opt = Cli::parse();
 
     let (layer, _guard) = opt.logs.layer();
