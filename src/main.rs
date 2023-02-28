@@ -1,8 +1,7 @@
 pub mod cli;
-pub mod cmd;
-pub mod db;
-pub mod dirs;
-pub mod state_sync;
+pub mod database;
+pub mod remote;
+pub mod sync;
 pub mod uploader;
 
 fn main() {

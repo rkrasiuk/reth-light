@@ -1,13 +1,13 @@
 use crate::{
-    db::{init_db, init_genesis},
-    dirs::{HeadersDbPath, StateDbPath},
-    state_sync::StateSync,
-    uploader::GithubUploader,
+    cli::dirs::{HeadersDbPath, StateDbPath},
+    database::{init_headers_db, init_state_db},
+    remote::{config::GithubStoreConfig, github::GithubRemoteStore},
+    sync::{run_sync, HeadersSync, StateSync},
 };
-use clap::{crate_version, Parser};
+use clap::{crate_version, Parser, ValueEnum};
 use eyre::Context;
 use fdlimit::raise_fd_limit;
-use futures::{pin_mut, Future, StreamExt};
+use futures::{pin_mut, StreamExt};
 use reth::{
     args::NetworkArgs,
     dirs::{ConfigPath, PlatformPath},
@@ -15,10 +15,7 @@ use reth::{
     runner::CliContext,
 };
 use reth_consensus::beacon::BeaconConsensus;
-use reth_db::{
-    mdbx::{Env, WriteMap},
-    tables, TableType,
-};
+use reth_db::mdbx::{Env, WriteMap};
 use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
@@ -29,17 +26,26 @@ use reth_interfaces::{
 };
 use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::NetworkInfo;
-use reth_primitives::{ChainSpec, H256};
+use reth_primitives::{ChainSpec, Head, H256};
 use reth_provider::{BlockProvider, HeaderProvider, ShareableDatabase};
 use reth_staged_sync::{utils::chainspec::genesis_value_parser, Config};
 use reth_tasks::TaskExecutor;
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 use tracing::*;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
+enum SyncMode {
+    Headers,
+    State,
+}
 
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct Command {
+    #[arg(value_enum)]
+    mode: SyncMode,
+
     #[arg(long, value_name = "FILE", verbatim_doc_comment, default_value_t)]
     config: PlatformPath<ConfigPath>,
 
@@ -77,30 +83,19 @@ impl Command {
         let mut config: Config = self.load_config()?;
         info!(target: "reth::cli", path = %self.config, "Configuration loaded");
 
-        info!(target: "reth::cli", headers_db = %self.headers_db, state_db = %self.state_db, "Opening databases");
-        let headers_db = init_db(
-            &self.headers_db,
-            &[
-                (TableType::Table, tables::Headers::const_name()),
-                (TableType::Table, tables::CanonicalHeaders::const_name()),
-            ],
-        )?;
-        let state_db = init_db(
-            &self.state_db,
-            &[
-                (TableType::Table, tables::PlainAccountState::const_name()),
-                (TableType::DupSort, tables::PlainStorageState::const_name()),
-                (TableType::Table, tables::Bytecodes::const_name()),
-            ],
-        )?;
-        info!(target: "reth::cli", "Databases opened");
+        let remote_store = GithubRemoteStore::new(GithubStoreConfig {
+            email: "rokrassyuk@gmail.com".to_owned(),
+            name: "Roman Krasiuk".to_owned(),
+            owner: "rkrasiuk".to_owned(),
+            repository: "reth-state-snapshots".to_owned(),
+            token: std::env::var("GITHUB_TOKEN").expect("failed to read auth token"),
+            agent: None,
+        })?;
 
-        debug!(target: "reth::cli", chain=%self.chain.chain, genesis=?self.chain.genesis_hash(), "Initializing genesis");
-        init_genesis(
-            Arc::clone(&headers_db),
-            Arc::clone(&state_db),
-            self.chain.clone(),
-        )?;
+        info!(target: "reth::cli", headers_db = %self.headers_db, "Opening headers database");
+        let headers_db =
+            init_headers_db(&self.headers_db, &remote_store, self.chain.clone()).await?;
+        info!(target: "reth::cli", "Headers database opened");
 
         let (consensus, _forkchoice_state_tx) = self.init_consensus()?;
         info!(target: "reth::cli", "Consensus engine initialized");
@@ -110,77 +105,48 @@ impl Command {
         info!(target: "reth::cli", "Connecting to P2P network");
         let network_config =
             self.load_network_config(&config, Arc::clone(&headers_db), ctx.task_executor.clone());
-        let network = self
-            .start_network(network_config, &ctx.task_executor, ())
-            .await?;
+        let network = self.start_network(network_config, &ctx.task_executor, ()).await?;
         info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), "Connected to P2P network");
-
-        let mut state_sync = self
-            .build_state_sync(
-                &mut config,
-                network.clone(),
-                consensus,
-                headers_db,
-                state_db,
-                &ctx.task_executor,
-            )
-            .await?;
 
         ctx.task_executor.spawn(events::handle_events(
             Some(network.clone()),
             network.event_listener().map(Into::into),
         ));
 
+        // TODO:
+        let state_db = init_state_db(&self.state_db, &remote_store, self.chain.clone()).await?;
+        let fetch_client = Arc::new(network.fetch_client().await?);
+        let header_downloader = ReverseHeadersDownloaderBuilder::from(config.stages.headers)
+            .build(fetch_client.clone(), consensus.clone())
+            .into_task_with(&ctx.task_executor);
+
+        let body_downloader = BodiesDownloaderBuilder::from(config.stages.bodies)
+            .build(fetch_client.clone(), consensus.clone(), Arc::clone(&headers_db))
+            .into_task_with(&ctx.task_executor);
+
+        let headers_sync = HeadersSync::new(headers_db, header_downloader, self.tip);
+        let state_sync = StateSync::new(state_db, body_downloader, Arc::new(self.chain.clone()));
+
         // Run sync
         let (rx, tx) = tokio::sync::oneshot::channel();
         info!(target: "reth::cli", "Starting state sync");
-        ctx.task_executor
-            .spawn_critical_blocking("state sync task", async move {
-                let res = state_sync.run().await;
-                let _ = rx.send(res);
-            });
+        ctx.task_executor.spawn_critical_blocking("state sync task", async move {
+            let res = run_sync(
+                headers_sync,
+                self.headers_db.as_ref(),
+                state_sync,
+                self.state_db.as_ref(),
+                remote_store,
+            )
+            .await;
+            let _ = rx.send(res);
+        });
 
         tx.await??;
 
         info!(target: "reth::cli", "State sync has finished.");
 
         Ok(())
-    }
-
-    async fn build_state_sync(
-        &self,
-        config: &mut Config,
-        network: NetworkHandle,
-        consensus: Arc<dyn Consensus>,
-        headers_db: Arc<Env<WriteMap>>,
-        state_db: Arc<Env<WriteMap>>,
-        task_executor: &TaskExecutor,
-    ) -> eyre::Result<StateSync<impl HeaderDownloader, impl BodyDownloader, Arc<Env<WriteMap>>>>
-    {
-        let fetch_client = Arc::new(network.fetch_client().await?);
-        let header_downloader = ReverseHeadersDownloaderBuilder::from(config.stages.headers)
-            .build(fetch_client.clone(), consensus.clone())
-            .into_task_with(task_executor);
-
-        let body_downloader = BodiesDownloaderBuilder::from(config.stages.bodies)
-            .build(
-                fetch_client.clone(),
-                consensus.clone(),
-                Arc::clone(&headers_db),
-            )
-            .into_task_with(task_executor);
-
-        let uploader = GithubUploader::new(self.state_db.clone().as_ref());
-
-        Ok(StateSync::new(
-            headers_db,
-            state_db,
-            header_downloader,
-            body_downloader,
-            uploader,
-            Arc::new(self.chain.clone()),
-            self.tip,
-        ))
     }
 
     fn load_config(&self) -> eyre::Result<Config> {
@@ -223,10 +189,8 @@ impl Command {
         C: BlockProvider + HeaderProvider + Clone + Unpin + 'static,
     {
         let client = config.client.clone();
-        let (handle, network, _txpool, eth) = NetworkManager::builder(config)
-            .await?
-            .request_handler(client)
-            .split_with_handle();
+        let (handle, network, _txpool, eth) =
+            NetworkManager::builder(config).await?.request_handler(client).split_with_handle();
 
         let known_peers_file = self.network.persistent_peers_file();
         task_executor.spawn_critical_with_signal("p2p network task", |shutdown| async move {
@@ -244,9 +208,17 @@ impl Command {
         db: Arc<Env<WriteMap>>,
         executor: TaskExecutor,
     ) -> NetworkConfig<ShareableDatabase<Arc<Env<WriteMap>>>> {
+        let head = Head {
+            number: 0,
+            hash: self.chain.genesis_hash(),
+            timestamp: self.chain.genesis.timestamp,
+            difficulty: self.chain.genesis.difficulty,
+            total_difficulty: self.chain.genesis.difficulty,
+        };
         self.network
             .network_config(config, self.chain.clone())
             .with_task_executor(Box::new(executor))
+            .set_head(head)
             .build(ShareableDatabase::new(db, self.chain.clone()))
     }
 }

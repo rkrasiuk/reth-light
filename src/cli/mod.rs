@@ -4,6 +4,9 @@ use reth::{
     runner::CliRunner,
 };
 
+pub mod dirs;
+pub mod sync;
+
 pub fn run() -> eyre::Result<()> {
     dotenv::dotenv().ok();
     let opt = Cli::parse();
@@ -23,7 +26,7 @@ pub fn run() -> eyre::Result<()> {
 pub enum Commands {
     /// Start light sync
     #[command(name = "sync")]
-    Sync(crate::cmd::Command),
+    Sync(sync::Command),
 }
 
 #[derive(Parser)]
