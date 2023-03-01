@@ -23,7 +23,7 @@ pub async fn run_sync<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
 ) -> eyre::Result<()> {
     let last_number = headers_sync.get_last_header_number()?;
 
-    if tip_num > last_number {
+    if tip_num >= last_number {
         headers_sync.run(tip_hash).await?;
 
         // TODO: make non-blocking
