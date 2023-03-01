@@ -59,7 +59,8 @@ impl DigitalOceanStore {
         let compressed = compress_file(content_path)?;
 
         tracing::trace!(target: "remote::digitalocean", path, "Putting object");
-        let compressed_path = compressed.path()?;
+        let compressed_path = compressed.path();
+        tracing::trace!(target: "remote::digitalocean", compressed = %compressed_path.display(), "Creating body from compressed file");
         let body = ByteStream::from_path(compressed_path).await?;
         let _ = self
             .client
