@@ -1,6 +1,6 @@
 use crate::{
     cli::dirs::{HeadersDbPath, StateDbPath},
-    database::{init_headers_db, init_state_db},
+    database::{init_headers_db, init_state_db, split::SplitDatabase},
     remote::digitalocean::store::DigitalOceanStore,
     sync::{run_sync, HeadersSync, StateSync},
 };
@@ -74,9 +74,14 @@ impl Command {
         let remote =
             DigitalOceanStore::new("fra1".to_owned(), "reth-state-snapshots".to_owned()).await;
 
-        info!(target: "reth::cli", headers_db = %self.headers_db, "Opening headers database");
-        let headers_db = init_headers_db(&self.headers_db, &remote, self.chain.clone()).await?;
-        info!(target: "reth::cli", "Headers database opened");
+        info!(target: "reth::cli", headers_db = %self.headers_db, "Opening split database");
+        let db = SplitDatabase::new(
+            &self.headers_db,
+            init_headers_db(&self.headers_db, &remote, self.chain.clone()).await?,
+            &self.state_db,
+            init_state_db(&self.state_db, &remote, self.chain.clone()).await?,
+        );
+        info!(target: "reth::cli", "Split database opened");
 
         let (consensus, _forkchoice_state_tx) =
             BeaconConsensus::builder().build(self.chain.clone());
@@ -86,7 +91,7 @@ impl Command {
 
         info!(target: "reth::cli", "Connecting to P2P network");
         let network_config =
-            self.load_network_config(&config, Arc::clone(&headers_db), ctx.task_executor.clone());
+            self.load_network_config(&config, db.headers(), ctx.task_executor.clone());
         let network = self.start_network(network_config, &ctx.task_executor, ()).await?;
         info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), "Connected to P2P network");
 
@@ -97,38 +102,26 @@ impl Command {
 
         let fetch_client = network.fetch_client().await?;
         let tip_number = self.fetch_tip(fetch_client.clone(), self.tip).await?;
+        let tip = (tip_number, self.tip);
 
         let fetch_client = Arc::new(fetch_client);
         let header_downloader = ReverseHeadersDownloaderBuilder::from(config.stages.headers)
             .build(fetch_client.clone(), consensus.clone())
             .into_task_with(&ctx.task_executor);
         let body_downloader = BodiesDownloaderBuilder::from(config.stages.bodies)
-            .build(fetch_client.clone(), consensus.clone(), Arc::clone(&headers_db))
+            .build(fetch_client.clone(), consensus.clone(), db.headers())
             .into_task_with(&ctx.task_executor);
 
-        let headers_sync = HeadersSync::new(Arc::clone(&headers_db), header_downloader);
+        let headers_sync = HeadersSync::new(db.headers(), header_downloader);
 
-        let state_db = init_state_db(&self.state_db, &remote, self.chain.clone()).await?;
-        let state_sync = StateSync::new(
-            Arc::clone(&state_db),
-            headers_db,
-            body_downloader,
-            Arc::new(self.chain.clone()),
-        );
+        let state_sync =
+            StateSync::new(db.state(), db.headers(), body_downloader, Arc::new(self.chain.clone()));
 
         // Run sync
         let (rx, tx) = tokio::sync::oneshot::channel();
         info!(target: "reth::cli", "Starting state sync");
         ctx.task_executor.spawn_critical_blocking("state sync task", async move {
-            let res = run_sync(
-                headers_sync,
-                self.headers_db.as_ref(),
-                state_sync,
-                self.state_db.as_ref(),
-                (tip_number, self.tip),
-                remote,
-            )
-            .await;
+            let res = run_sync(db, headers_sync, state_sync, tip, remote).await;
             let _ = rx.send(res);
         });
 

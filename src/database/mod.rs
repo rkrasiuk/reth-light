@@ -17,6 +17,7 @@ mod init;
 use init::init_database;
 
 pub mod provider;
+pub mod split;
 
 pub const MDBX_DAT: &str = "mdbx.dat";
 

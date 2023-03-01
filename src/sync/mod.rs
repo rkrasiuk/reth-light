@@ -1,10 +1,13 @@
-use crate::{database::MDBX_DAT, remote::digitalocean::store::DigitalOceanStore};
+use crate::{
+    database::{split::SplitDatabase, MDBX_DAT},
+    remote::digitalocean::store::DigitalOceanStore,
+};
 use reth_db::database::Database;
 use reth_interfaces::p2p::{
     bodies::downloader::BodyDownloader, headers::downloader::HeaderDownloader,
 };
 use reth_primitives::{BlockNumber, H256};
-use std::{fs, path::Path};
+use std::fs;
 
 mod headers_sync;
 pub use headers_sync::HeadersSync;
@@ -13,10 +16,9 @@ mod state_sync;
 pub use state_sync::StateSync;
 
 pub async fn run_sync<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
+    db: SplitDatabase,
     mut headers_sync: HeadersSync<DB, H>,
-    headers_db_path: &Path,
     mut state_sync: StateSync<DB, B>,
-    state_db_path: &Path,
     (tip_num, tip_hash): (BlockNumber, H256),
     remote: DigitalOceanStore,
 ) -> eyre::Result<()> {
@@ -27,7 +29,7 @@ pub async fn run_sync<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
 
         // TODO: make non-blocking
         let snapshot_key = format!("headers-{tip_num}.dat.gz");
-        remote.save(&snapshot_key, &fs::read(headers_db_path.join(MDBX_DAT))?).await?;
+        remote.save(&snapshot_key, &fs::read(db.headers_path.join(MDBX_DAT))?).await?;
 
         // Clean up any previous header entries
         for entry in remote.list(Some("headers-")).await? {
@@ -51,7 +53,7 @@ pub async fn run_sync<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
         {
             tracing::trace!(target: "sync", block = sync_until, "Creating state snapshot");
             let snapshot_key = format!("state-snapshots/state-{sync_until}.dat.gz");
-            remote.save(&snapshot_key, &fs::read(state_db_path.join(MDBX_DAT))?).await?;
+            remote.save(&snapshot_key, &fs::read(db.state_path.join(MDBX_DAT))?).await?;
         }
     }
 
