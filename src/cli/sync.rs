@@ -41,9 +41,8 @@ enum SyncEnum {
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct Command {
-    #[arg(value_enum)]
-    sync: SyncEnum,
-
+    // #[arg(value_enum)]
+    // sync: SyncEnum,
     #[arg(long, value_name = "FILE", verbatim_doc_comment, default_value_t)]
     config: PlatformPath<ConfigPath>,
 
