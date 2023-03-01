@@ -10,7 +10,7 @@ use reth_db::{
 };
 use reth_primitives::{Account, ChainSpec};
 use reth_staged_sync::utils::init::InitDatabaseError;
-use reth_stages::stages::EXECUTION;
+use reth_stages::stages::{EXECUTION, HEADERS};
 use std::{path::Path, sync::Arc};
 
 mod init;
@@ -31,59 +31,58 @@ pub const STATE_TABLES: [(TableType, &str); 4] = [
     (TableType::Table, tables::Bytecodes::const_name()),
 ];
 
+fn header_snaphot_progress(name: &str) -> u64 {
+    let block_str = name.strip_prefix("headers-").unwrap().strip_suffix(".dat.gz").unwrap();
+    let block: u64 = block_str.parse().unwrap();
+    block
+}
+
 pub async fn init_headers_db<P: AsRef<Path>>(
     path: P,
     remote: &DigitalOceanStore,
     chain_spec: ChainSpec,
 ) -> eyre::Result<Arc<Env<WriteMap>>> {
+    let local = init_database(&path, &HEADERS_TABLES)?;
+    let progress = HEADERS.get_progress(&local.tx()?)?.unwrap_or_default();
     let snapshots = remote.list(Some("headers-")).await?;
-    if !snapshots.is_empty() {
+    let db = {
         let best_snapshot = snapshots
             .into_iter()
-            .sorted_by_key(|s| {
-                let block_str = s
-                    .key()
-                    .unwrap()
-                    .strip_prefix("headers-")
-                    .unwrap()
-                    .strip_suffix(".dat.gz")
-                    .unwrap();
-                let block: u64 = block_str.parse().unwrap();
-                block
-            })
+            .map(|s| (header_snaphot_progress(s.key().unwrap()), s))
+            .sorted_by_key(|s| s.0)
             .rev()
             .next()
-            .unwrap();
+            .filter(|s| s.0 > progress);
+        if let Some((_, snapshot)) = best_snapshot {
+            drop(local);
+            let raw = remote.retrieve(snapshot.key().unwrap()).await?.unwrap();
+            restore_database(path, &raw)?
+        } else {
+            local
+        }
+    };
 
-        let raw = remote.retrieve(best_snapshot.key().unwrap()).await?.unwrap();
-        restore_database(path, &raw)
-    } else {
-        let db = init_database(path, &HEADERS_TABLES)?;
+    let header = chain_spec.genesis_header();
+    let hash = header.hash_slow();
 
-        let header = chain_spec.genesis_header();
-        let hash = header.hash_slow();
-
-        if let Some((_, db_hash)) =
-            db.view(|tx| tx.cursor_read::<tables::CanonicalHeaders>()?.first())??
-        {
-            if db_hash == hash {
-                tracing::debug!("Genesis already written, skipping.");
-                return Ok(db)
-            }
-
-            return Err(
-                InitDatabaseError::GenesisHashMismatch { expected: hash, actual: db_hash }.into()
-            )
+    if let Some((_, db_hash)) =
+        db.view(|tx| tx.cursor_read::<tables::CanonicalHeaders>()?.first())??
+    {
+        if db_hash == hash {
+            tracing::debug!("Genesis already written, skipping.");
+            return Ok(db)
         }
 
-        tracing::debug!("Writing genesis block.");
-        db.update(|tx| {
-            tx.put::<tables::CanonicalHeaders>(0, hash)?;
-            tx.put::<tables::Headers>(0, header.clone())
-        })??;
-
-        Ok(db)
+        return Err(InitDatabaseError::GenesisHashMismatch { expected: hash, actual: db_hash }.into())
     }
+
+    tracing::debug!("Writing genesis block.");
+    db.update(|tx| {
+        tx.put::<tables::CanonicalHeaders>(0, hash)?;
+        tx.put::<tables::Headers>(0, header.clone())
+    })??;
+
+    Ok(db)
 }
 
 pub async fn init_state_db<P: AsRef<Path>>(
