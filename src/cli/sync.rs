@@ -106,10 +106,15 @@ impl Command {
             .build(fetch_client.clone(), consensus.clone(), Arc::clone(&headers_db))
             .into_task_with(&ctx.task_executor);
 
-        let headers_sync = HeadersSync::new(headers_db, header_downloader);
+        let headers_sync = HeadersSync::new(Arc::clone(&headers_db), header_downloader);
 
         let state_db = init_state_db(&self.state_db, &remote, self.chain.clone()).await?;
-        let state_sync = StateSync::new(state_db, body_downloader, Arc::new(self.chain.clone()));
+        let state_sync = StateSync::new(
+            Arc::clone(&state_db),
+            headers_db,
+            body_downloader,
+            Arc::new(self.chain.clone()),
+        );
 
         // Run sync
         let (rx, tx) = tokio::sync::oneshot::channel();

@@ -16,6 +16,8 @@ use std::{path::Path, sync::Arc};
 mod init;
 use init::init_database;
 
+pub mod provider;
+
 pub const MDBX_DAT: &str = "mdbx.dat";
 
 pub const HEADERS_TABLES: [(TableType, &str); 3] = [

@@ -16,15 +16,23 @@ use reth_revm::database::{State, SubState};
 use reth_stages::stages::EXECUTION;
 use std::{ops::Range, sync::Arc};
 
+use crate::database::provider::LatestSplitStateProvider;
+
 pub struct StateSync<DB, B> {
-    db: DB,
+    state_db: DB,
+    headers_db: DB,
     body_downloader: B,
     chain_spec: Arc<ChainSpec>,
 }
 
 impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
-    pub fn new(db: DB, body_downloader: B, chain_spec: Arc<ChainSpec>) -> Self {
-        Self { db, body_downloader, chain_spec }
+    pub fn new(
+        state_db: DB,
+        headers_db: DB,
+        body_downloader: B,
+        chain_spec: Arc<ChainSpec>,
+    ) -> Self {
+        Self { state_db, headers_db, body_downloader, chain_spec }
     }
 
     pub fn get_td(&self, block: BlockNumber) -> eyre::Result<U256> {
@@ -33,7 +41,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
         }
 
         let mut td = U256::ZERO;
-        let tx = self.db.tx()?;
+        let tx = self.state_db.tx()?;
         for entry in tx.cursor_read::<tables::Headers>()?.walk_range(..=block)? {
             let (_, header) = entry?;
             td += header.difficulty;
@@ -42,7 +50,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
     }
 
     pub fn get_progress(&self) -> eyre::Result<BlockNumber> {
-        Ok(EXECUTION.get_progress(&self.db.tx()?)?.unwrap_or_default())
+        Ok(EXECUTION.get_progress(&self.state_db.tx()?)?.unwrap_or_default())
     }
 
     pub async fn run(&mut self, range: Range<BlockNumber>) -> eyre::Result<()> {
@@ -84,8 +92,10 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
             latest = end;
             tracing::trace!(target: "sync", start, end, "Executing blocks");
 
-            let tx = self.db.tx_mut()?;
-            let mut state_provider = SubState::new(State::new(LatestStateProviderRef::new(&tx)));
+            let tx = self.state_db.tx_mut()?;
+            let headers_tx = self.headers_db.tx_mut()?;
+            let mut state_provider =
+                SubState::new(State::new(LatestSplitStateProvider::new(&headers_tx, &tx)));
             let mut changesets = Vec::with_capacity(blocks.len());
             for (block, senders, td) in blocks {
                 let block_number = block.number;
