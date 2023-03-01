@@ -34,7 +34,6 @@ serde_json = "1"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 tempfile = "3.4.0"
 bytes = "1.4"
-filepath = "0.1.2"
 
 # cli
 clap = { git = "https://github.com/rkrasiuk/clap", branch = "rkrasiuk/fix-almost-swapped-lint", features = ["derive", "cargo"] }

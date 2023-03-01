@@ -2,9 +2,9 @@ use crate::{
     cli::dirs::{HeadersDbPath, StateDbPath},
     database::{init_headers_db, init_state_db, split::SplitDatabase},
     remote::digitalocean::store::DigitalOceanStore,
-    sync::{run_sync, HeadersSync, StateSync},
+    sync::{run_sync_with_snapshots, HeadersSync, StateSync, Tip},
 };
-use clap::{crate_version, Parser};
+use clap::{crate_version, Parser, ValueEnum};
 use eyre::Context;
 use fdlimit::raise_fd_limit;
 use futures::{pin_mut, StreamExt};
@@ -32,9 +32,18 @@ use reth_tasks::TaskExecutor;
 use std::{path::PathBuf, sync::Arc};
 use tracing::*;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
+enum SyncEnum {
+    Headers,
+    State,
+}
+
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct Command {
+    #[arg(value_enum)]
+    sync: SyncEnum,
+
     #[arg(long, value_name = "FILE", verbatim_doc_comment, default_value_t)]
     config: PlatformPath<ConfigPath>,
 
@@ -75,12 +84,7 @@ impl Command {
             DigitalOceanStore::new("fra1".to_owned(), "reth-state-snapshots".to_owned()).await;
 
         info!(target: "reth::cli", headers_db = %self.headers_db, "Opening split database");
-        let db = SplitDatabase::new(
-            &self.headers_db,
-            init_headers_db(&self.headers_db, &remote, self.chain.clone()).await?,
-            &self.state_db,
-            init_state_db(&self.state_db, &remote, self.chain.clone()).await?,
-        );
+        let headers_db = init_headers_db(&self.headers_db, &remote, self.chain.clone()).await?;
         info!(target: "reth::cli", "Split database opened");
 
         let (consensus, _forkchoice_state_tx) =
@@ -91,7 +95,7 @@ impl Command {
 
         info!(target: "reth::cli", "Connecting to P2P network");
         let network_config =
-            self.load_network_config(&config, db.headers(), ctx.task_executor.clone());
+            self.load_network_config(&config, headers_db.clone(), ctx.task_executor.clone());
         let network = self.start_network(network_config, &ctx.task_executor, ()).await?;
         info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), "Connected to P2P network");
 
@@ -101,8 +105,14 @@ impl Command {
         ));
 
         let fetch_client = network.fetch_client().await?;
-        let tip_number = self.fetch_tip(fetch_client.clone(), self.tip).await?;
-        let tip = (tip_number, self.tip);
+        let tip = Tip::new(self.tip, self.fetch_tip(fetch_client.clone(), self.tip).await?);
+
+        let db = SplitDatabase::new(
+            &self.headers_db,
+            headers_db,
+            &self.state_db,
+            init_state_db(&self.state_db, &remote, self.chain.clone(), tip).await?,
+        );
 
         let fetch_client = Arc::new(fetch_client);
         let header_downloader = ReverseHeadersDownloaderBuilder::from(config.stages.headers)
@@ -121,7 +131,7 @@ impl Command {
         let (rx, tx) = tokio::sync::oneshot::channel();
         info!(target: "reth::cli", "Starting state sync");
         ctx.task_executor.spawn_critical_blocking("state sync task", async move {
-            let res = run_sync(db, headers_sync, state_sync, tip, remote).await;
+            let res = run_sync_with_snapshots(headers_sync, state_sync, tip, remote, db).await;
             let _ = rx.send(res);
         });
 

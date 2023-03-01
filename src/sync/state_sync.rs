@@ -52,7 +52,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
     }
 
     pub async fn run(&mut self, range: Range<BlockNumber>) -> eyre::Result<()> {
-        tracing::trace!(target: "sync", ?range, "Downloading bodies");
+        tracing::trace!(target: "sync::state", ?range, "Downloading bodies");
         self.body_downloader.set_download_range(range.clone())?;
 
         let mut latest = range.start;
@@ -61,7 +61,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
         while latest + 1 < range.end {
             let bodies =
                 self.body_downloader.try_next().await?.ok_or(eyre::eyre!("channel closed"))?;
-            tracing::trace!(target: "sync", len = bodies.len(), "Downloaded bodies");
+            tracing::trace!(target: "sync::state", len = bodies.len(), "Downloaded bodies");
             let blocks = bodies
                 .into_iter()
                 .map(|body| -> eyre::Result<_> {
@@ -88,42 +88,55 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
 
             let (start, end) = (blocks.first().unwrap().0.number, blocks.last().unwrap().0.number);
             latest = end;
-            tracing::trace!(target: "sync", start, end, "Executing blocks");
+            tracing::trace!(target: "sync::state", start, end, "Executing blocks");
 
-            let tx = self.state_db.tx_mut()?;
-            let headers_tx = self.headers_db.tx_mut()?;
-            let mut state_provider =
-                SubState::new(State::new(LatestSplitStateProvider::new(&headers_tx, &tx)));
-            let mut changesets = Vec::with_capacity(blocks.len());
-            for (block, senders, td) in blocks {
-                let block_number = block.number;
-                let changeset = reth_executor::executor::execute_and_verify_receipt(
-                    &block.unseal(),
-                    td,
-                    Some(senders),
-                    &self.chain_spec,
-                    &mut state_provider,
-                )
-                .map_err(|error| {
-                    eyre::eyre!("Execution error at block #{block_number}: {error:?}")
-                })?;
-                changesets.push((block_number, changeset));
-            }
-            tracing::trace!(target: "sync", start, end, "Executed blocks");
-
-            // apply changes to plain database.
-            for (block_number, result) in changesets.into_iter() {
-                self.apply_state_changes(&tx, block_number, result)?;
-            }
-
-            EXECUTION.save_progress(&tx, latest)?;
-            tx.commit()?;
-            tracing::trace!(target: "sync", progress = latest, "Plain state updated");
+            std::thread::scope(|scope| {
+                let handle = std::thread::Builder::new()
+                    .stack_size(50 * 1024 * 1024)
+                    .spawn_scoped(scope, || {
+                        // execute and store output to results
+                        self.execute_inner(latest, blocks)
+                    })
+                    .expect("Expects that thread name is not null");
+                handle.join().expect("Expects for thread to not panic")
+            })?;
         }
 
-        // tracing::trace!(target: "sync", latest, "Uploading state");
-        // self.uploader.upload_state(latest).await?;
+        Ok(())
+    }
 
+    fn execute_inner(
+        &self,
+        latest: BlockNumber,
+        blocks: Vec<(SealedBlock, Vec<Address>, U256)>,
+    ) -> eyre::Result<()> {
+        let tx = self.state_db.tx_mut()?;
+        let headers_tx = self.headers_db.tx_mut()?;
+        let mut state_provider =
+            SubState::new(State::new(LatestSplitStateProvider::new(&headers_tx, &tx)));
+        let mut changesets = Vec::with_capacity(blocks.len());
+        for (block, senders, td) in blocks {
+            let block_number = block.number;
+            let changeset = reth_executor::executor::execute_and_verify_receipt(
+                &block.unseal(),
+                td,
+                Some(senders),
+                &self.chain_spec,
+                &mut state_provider,
+            )
+            .map_err(|error| eyre::eyre!("Execution error at block #{block_number}: {error:?}"))?;
+            changesets.push((block_number, changeset));
+        }
+        tracing::trace!(target: "sync::state", latest, "Executed blocks");
+
+        // apply changes to plain database.
+        for (block_number, result) in changesets.into_iter() {
+            self.apply_state_changes(&tx, block_number, result)?;
+        }
+
+        EXECUTION.save_progress(&tx, latest)?;
+        tx.commit()?;
+        tracing::trace!(target: "sync::state", progress = latest, "Plain state updated");
         Ok(())
     }
 

@@ -1846,16 +1846,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "filepath"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7faa16fcec147281a1719947edb44af4f9124964bf7476bd5f5356a48e44dcc"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "fixed-hash"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4304,7 +4294,6 @@ dependencies = [
  "dotenv",
  "eyre",
  "fdlimit",
- "filepath",
  "flate2",
  "futures",
  "itertools 0.10.5",

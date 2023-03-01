@@ -1,4 +1,6 @@
-use crate::{database::init::restore_database, remote::digitalocean::store::DigitalOceanStore};
+use crate::{
+    database::init::restore_database, remote::digitalocean::store::DigitalOceanStore, sync::Tip,
+};
 use itertools::Itertools;
 use reth_db::{
     cursor::DbCursorRO,
@@ -34,9 +36,17 @@ pub const STATE_TABLES: [(TableType, &str); 4] = [
     (TableType::Table, tables::Bytecodes::const_name()),
 ];
 
-fn header_snaphot_progress(name: &str) -> u64 {
-    let block_str = name.strip_prefix("headers-").unwrap().strip_suffix(".dat.gz").unwrap();
-    let block: u64 = block_str.parse().unwrap();
+fn header_snapshot_progress(key: &str) -> u64 {
+    let key = key.strip_prefix("headers-").unwrap();
+    let key = key.strip_suffix(".dat.gz").unwrap();
+    let block: u64 = key.parse().unwrap();
+    block
+}
+
+fn state_snapshot_progress(key: &str) -> u64 {
+    let key = key.strip_prefix("state-snapshots/state-").unwrap();
+    let key = key.strip_suffix(".dat.gz").unwrap();
+    let block: u64 = key.parse().unwrap();
     block
 }
 
@@ -51,7 +61,7 @@ pub async fn init_headers_db<P: AsRef<Path>>(
     let db = {
         let best_snapshot = snapshots
             .into_iter()
-            .map(|s| (header_snaphot_progress(s.key().unwrap()), s))
+            .map(|s| (header_snapshot_progress(s.key().unwrap()), s))
             .sorted_by_key(|s| s.0)
             .rev()
             .next()
@@ -90,12 +100,29 @@ pub async fn init_headers_db<P: AsRef<Path>>(
 
 pub async fn init_state_db<P: AsRef<Path>>(
     path: P,
-    _remote: &DigitalOceanStore,
+    remote: &DigitalOceanStore,
     chain_spec: ChainSpec,
+    _tip: Tip,
 ) -> eyre::Result<Arc<Env<WriteMap>>> {
-    // TODO: check remote
-
-    let db = init_database(path, &STATE_TABLES)?;
+    let local = init_database(&path, &STATE_TABLES)?;
+    let progress = EXECUTION.get_progress(&local.tx()?)?.unwrap_or_default();
+    let snapshots = remote.list(Some("state-snapshots/state-")).await?;
+    let db = {
+        let best_snapshot = snapshots
+            .into_iter()
+            .map(|s| (state_snapshot_progress(s.key().unwrap()), s))
+            .sorted_by_key(|s| s.0)
+            .rev()
+            .next()
+            .filter(|s| s.0 > progress);
+        if let Some((_, snapshot)) = best_snapshot {
+            drop(local);
+            let raw = remote.retrieve(snapshot.key().unwrap()).await?.unwrap();
+            restore_database(path, &raw)?
+        } else {
+            local
+        }
+    };
 
     let progress = EXECUTION.get_progress(&db.tx()?)?;
     if progress.is_none() {

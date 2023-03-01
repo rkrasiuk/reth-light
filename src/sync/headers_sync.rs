@@ -11,6 +11,8 @@ use reth_primitives::{BlockNumber, SealedHeader, H256};
 use reth_provider::ProviderError;
 use reth_stages::stages::{SyncGap, HEADERS};
 
+use super::Tip;
+
 pub struct HeadersSync<DB, H> {
     pub db: DB,
     header_downloader: H,
@@ -21,6 +23,10 @@ impl<DB: Database, H: HeaderDownloader> HeadersSync<DB, H> {
         Self { db, header_downloader }
     }
 
+    pub fn get_progress(&self) -> eyre::Result<BlockNumber> {
+        Ok(HEADERS.get_progress(&self.db.tx()?)?.unwrap_or_default())
+    }
+
     pub fn get_last_header_number(&self) -> eyre::Result<BlockNumber> {
         let (last_number, _) = self
             .db
@@ -29,11 +35,17 @@ impl<DB: Database, H: HeaderDownloader> HeadersSync<DB, H> {
         Ok(last_number)
     }
 
-    pub async fn run(&mut self, tip: H256) -> eyre::Result<()> {
+    pub async fn run(&mut self, tip: Tip) -> eyre::Result<()> {
         // Download headers
-        let headers_progress = HEADERS.get_progress(&self.db.tx()?)?.unwrap_or_default();
-        tracing::trace!(target: "sync::headers", headers_progress, "Commencing sync");
-        while let Some(gap) = self.get_sync_gap(headers_progress, tip)? {
+        let headers_progress = self.get_progress()?;
+
+        if tip.number <= headers_progress {
+            tracing::info!(target: "sync::headers", progress = headers_progress, tip = tip.number, "Nothing to sync");
+            return Ok(())
+        }
+
+        tracing::trace!(target: "sync::headers", progress = headers_progress, "Commencing sync");
+        while let Some(gap) = self.get_sync_gap(headers_progress, tip.hash)? {
             if !gap.is_closed() {
                 self.header_downloader.update_sync_gap(gap.local_head, gap.target);
 

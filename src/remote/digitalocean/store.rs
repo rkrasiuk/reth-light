@@ -5,7 +5,6 @@ use aws_sdk_s3::{
     Client, Region as AwsRegion,
 };
 use aws_smithy_http::byte_stream::ByteStream;
-use filepath::FilePath;
 use flate2::write::GzDecoder;
 use std::{io::Write, path::Path};
 

@@ -14,20 +14,32 @@ pub use headers_sync::HeadersSync;
 mod state_sync;
 pub use state_sync::StateSync;
 
-pub async fn run_sync<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
-    db: SplitDatabase,
+#[derive(Debug, Clone, Copy)]
+pub struct Tip {
+    hash: H256,
+    number: BlockNumber,
+}
+
+impl Tip {
+    pub fn new(hash: H256, number: BlockNumber) -> Self {
+        Self { hash, number }
+    }
+}
+
+pub async fn run_sync_with_snapshots<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
     mut headers_sync: HeadersSync<DB, H>,
     mut state_sync: StateSync<DB, B>,
-    (tip_num, tip_hash): (BlockNumber, H256),
+    tip: Tip,
     remote: DigitalOceanStore,
+    db: SplitDatabase,
 ) -> eyre::Result<()> {
-    let last_number = headers_sync.get_last_header_number()?;
+    let last_progress = headers_sync.get_progress()?;
+    headers_sync.run(tip).await?;
 
-    if tip_num > last_number {
-        headers_sync.run(tip_hash).await?;
-
+    let new_progress = headers_sync.get_progress()?;
+    if headers_sync.get_progress()? > last_progress {
         // TODO: make non-blocking
-        let snapshot_key = format!("headers-{tip_num}.dat.gz");
+        let snapshot_key = format!("headers-{new_progress}.dat.gz");
         let header_db_path = db.headers_path.join(MDBX_DAT);
         remote.save(&snapshot_key, &header_db_path).await?;
 
@@ -41,15 +53,15 @@ pub async fn run_sync<DB: Database, H: HeaderDownloader, B: BodyDownloader>(
     }
 
     let snapshot_interval = 100_000;
-    let mut sync_from = state_sync.get_progress()?;
-    while sync_from <= last_number {
+    let mut sync_from = state_sync.get_progress()? + 1;
+    while sync_from <= new_progress {
         let sync_until =
-            last_number.min(sync_from + snapshot_interval - (sync_from % snapshot_interval));
+            new_progress.min(sync_from + snapshot_interval - (sync_from % snapshot_interval));
         state_sync.run(sync_from..sync_until + 1).await?;
         sync_from = sync_until + 1;
 
-        if sync_until != last_number ||
-            (sync_until == last_number && last_number % snapshot_interval == 0)
+        if sync_until != new_progress ||
+            (sync_until == new_progress && new_progress % snapshot_interval == 0)
         {
             tracing::trace!(target: "sync", block = sync_until, "Creating state snapshot");
             let snapshot_key = format!("state-snapshots/state-{sync_until}.dat.gz");
