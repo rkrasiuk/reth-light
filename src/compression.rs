@@ -5,12 +5,12 @@ use std::{
     path::Path,
     time::Instant,
 };
-use tempfile::tempfile;
 
 pub fn compress_file(path: &Path) -> eyre::Result<File> {
+    let tempdir = tempfile::tempdir()?;
     tracing::trace!(target: "compression", path = %path.display(), "Compressing file");
     let mut input = BufReader::new(File::open(path)?);
-    let output = tempfile()?;
+    let output = File::create(tempdir.path().join("tmp"))?;
     let mut encoder = GzEncoder::new(output, Compression::default());
     let start = Instant::now();
     copy(&mut input, &mut encoder)?;
