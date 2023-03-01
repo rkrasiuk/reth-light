@@ -27,6 +27,7 @@ impl DigitalOceanStore {
     }
 
     pub async fn list(&self, prefix: Option<&str>) -> eyre::Result<Vec<Object>> {
+        tracing::trace!(target: "remote::digitalocean", ?prefix, "Listing objects");
         let response = self
             .client
             .list_objects_v2()
@@ -38,6 +39,7 @@ impl DigitalOceanStore {
     }
 
     pub async fn retrieve(&self, path: &str) -> eyre::Result<Option<Vec<u8>>> {
+        tracing::trace!(target: "remote::digitalocean", path, "Retrieving object");
         match self.client.get_object().bucket(&self.bucket).key(path).send().await {
             Ok(obj) => {
                 let mut decoder = GzDecoder::new(Vec::new());
@@ -52,11 +54,12 @@ impl DigitalOceanStore {
     }
 
     pub async fn save(&self, path: &str, content: &[u8]) -> eyre::Result<()> {
-        tracing::trace!(target: "remote", path, "Compressing file");
+        tracing::trace!(target: "remote::digitalocean", path, "Compressing contents");
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(content)?;
         let compressed = encoder.finish()?;
 
+        tracing::trace!(target: "remote::digitalocean", path, "Putting object");
         let _ = self
             .client
             .put_object()
@@ -71,6 +74,7 @@ impl DigitalOceanStore {
     }
 
     pub async fn delete(&self, path: &str) -> eyre::Result<()> {
+        tracing::trace!(target: "remote::digitalocean", path, "Deleting object");
         let _ = self.client.delete_object().bucket(&self.bucket).key(path).send().await?;
 
         Ok(())
