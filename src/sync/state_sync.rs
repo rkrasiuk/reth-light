@@ -1,6 +1,7 @@
 use futures::TryStreamExt;
 use rayon::prelude::*;
 use reth_db::{
+    cursor::DbCursorRO,
     database::Database,
     tables,
     transaction::{DbTx, DbTxMut},
@@ -13,7 +14,7 @@ use reth_primitives::{
 use reth_provider::LatestStateProviderRef;
 use reth_revm::database::{State, SubState};
 use reth_stages::stages::EXECUTION;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 pub struct StateSync<DB, B> {
     db: DB,
@@ -26,14 +27,30 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
         Self { db, body_downloader, chain_spec }
     }
 
-    pub async fn run(&mut self, until: BlockNumber) -> eyre::Result<()> {
-        let execution_progress = EXECUTION.get_progress(&self.db.tx()?)?.unwrap_or_default();
-        let range = execution_progress..until + 1;
+    pub fn get_td(&self, block: BlockNumber) -> eyre::Result<U256> {
+        if block == 0 {
+            return Ok(self.chain_spec.genesis.difficulty)
+        }
+
+        let mut td = U256::ZERO;
+        let tx = self.db.tx()?;
+        for entry in tx.cursor_read::<tables::Headers>()?.walk_range(..=block)? {
+            let (_, header) = entry?;
+            td += header.difficulty;
+        }
+        Ok(td)
+    }
+
+    pub fn get_progress(&self) -> eyre::Result<BlockNumber> {
+        Ok(EXECUTION.get_progress(&self.db.tx()?)?.unwrap_or_default())
+    }
+
+    pub async fn run(&mut self, range: Range<BlockNumber>) -> eyre::Result<()> {
         tracing::trace!(target: "sync", ?range, "Downloading bodies");
         self.body_downloader.set_download_range(range.clone())?;
 
-        let mut latest = 0;
-        let mut td = self.chain_spec.genesis.difficulty;
+        let mut latest = range.start;
+        let mut td = self.get_td(range.start)?;
 
         while latest + 1 < range.end {
             let bodies =
