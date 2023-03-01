@@ -7,7 +7,7 @@ use std::{fs, path::Path, sync::Arc};
 
 pub fn restore_database<P: AsRef<Path>>(
     path: P,
-    contents: String,
+    contents: &[u8],
 ) -> eyre::Result<Arc<Env<WriteMap>>> {
     fs::write(path.as_ref().join(MDBX_DAT), contents)?;
     let db = Env::<WriteMap>::open(path.as_ref(), reth_db::mdbx::EnvKind::RW)?;

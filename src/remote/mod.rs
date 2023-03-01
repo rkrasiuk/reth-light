@@ -1,3 +1,2 @@
-pub mod config;
+pub mod digitalocean;
 pub mod github;
-pub mod models;

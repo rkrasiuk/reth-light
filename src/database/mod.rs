@@ -1,4 +1,5 @@
-use crate::remote::github::GithubRemoteStore;
+use crate::{database::init::restore_database, remote::digitalocean::store::DigitalOceanStore};
+use itertools::Itertools;
 use reth_db::{
     cursor::DbCursorRO,
     database::Database,
@@ -13,7 +14,7 @@ use reth_stages::stages::EXECUTION;
 use std::{path::Path, sync::Arc};
 
 mod init;
-use init::{init_database, restore_database};
+use init::init_database;
 
 pub const MDBX_DAT: &str = "mdbx.dat";
 
@@ -32,12 +33,30 @@ pub const STATE_TABLES: [(TableType, &str); 4] = [
 
 pub async fn init_headers_db<P: AsRef<Path>>(
     path: P,
-    remote: &GithubRemoteStore,
+    remote: &DigitalOceanStore,
     chain_spec: ChainSpec,
 ) -> eyre::Result<Arc<Env<WriteMap>>> {
-    // TODO:
-    if let Some(content) = remote.retrieve("TODO:").await? {
-        restore_database(path, content)
+    let snapshots = remote.list(Some("headers-")).await?;
+    if !snapshots.is_empty() {
+        let best_snapshot = snapshots
+            .into_iter()
+            .sorted_by_key(|s| {
+                let block_str = s
+                    .key()
+                    .unwrap()
+                    .strip_prefix("headers-")
+                    .unwrap()
+                    .strip_suffix(".dat.gz")
+                    .unwrap();
+                let block: u64 = block_str.parse().unwrap();
+                block
+            })
+            .rev()
+            .next()
+            .unwrap();
+
+        let raw = remote.retrieve(best_snapshot.key().unwrap()).await?.unwrap();
+        restore_database(path, &raw)
     } else {
         let db = init_database(path, &HEADERS_TABLES)?;
 
@@ -69,7 +88,7 @@ pub async fn init_headers_db<P: AsRef<Path>>(
 
 pub async fn init_state_db<P: AsRef<Path>>(
     path: P,
-    remote: &GithubRemoteStore,
+    _remote: &DigitalOceanStore,
     chain_spec: ChainSpec,
 ) -> eyre::Result<Arc<Env<WriteMap>>> {
     // TODO: check remote

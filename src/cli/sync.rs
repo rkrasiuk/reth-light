@@ -1,10 +1,10 @@
 use crate::{
     cli::dirs::{HeadersDbPath, StateDbPath},
     database::{init_headers_db, init_state_db},
-    remote::{config::GithubStoreConfig, github::GithubRemoteStore},
+    remote::digitalocean::store::DigitalOceanStore,
     sync::{run_sync, HeadersSync, StateSync},
 };
-use clap::{crate_version, Parser, ValueEnum};
+use clap::{crate_version, Parser};
 use eyre::Context;
 use fdlimit::raise_fd_limit;
 use futures::{pin_mut, StreamExt};
@@ -13,6 +13,7 @@ use reth::{
     dirs::{ConfigPath, PlatformPath},
     node::events,
     runner::CliContext,
+    utils::get_single_header,
 };
 use reth_consensus::beacon::BeaconConsensus;
 use reth_db::mdbx::{Env, WriteMap};
@@ -20,32 +21,20 @@ use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
 };
-use reth_interfaces::{
-    consensus::{Consensus, ForkchoiceState},
-    p2p::{bodies::downloader::BodyDownloader, headers::downloader::HeaderDownloader},
+use reth_network::{
+    error::NetworkError, FetchClient, NetworkConfig, NetworkHandle, NetworkManager,
 };
-use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::NetworkInfo;
-use reth_primitives::{ChainSpec, Head, H256};
+use reth_primitives::{BlockHashOrNumber, ChainSpec, Head, H256};
 use reth_provider::{BlockProvider, HeaderProvider, ShareableDatabase};
 use reth_staged_sync::{utils::chainspec::genesis_value_parser, Config};
 use reth_tasks::TaskExecutor;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::watch;
 use tracing::*;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
-enum SyncMode {
-    Headers,
-    State,
-}
 
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct Command {
-    #[arg(value_enum)]
-    mode: SyncMode,
-
     #[arg(long, value_name = "FILE", verbatim_doc_comment, default_value_t)]
     config: PlatformPath<ConfigPath>,
 
@@ -76,28 +65,21 @@ impl Command {
     pub async fn execute(self, ctx: CliContext) -> eyre::Result<()> {
         info!(target: "reth::cli", "reth {} starting", crate_version!());
 
-        // Raise the fd limit of the process.
-        // Does not do anything on windows.
+        // Raise the fd limit of the process. Does not do anything on windows.
         raise_fd_limit();
 
         let mut config: Config = self.load_config()?;
         info!(target: "reth::cli", path = %self.config, "Configuration loaded");
 
-        let remote_store = GithubRemoteStore::new(GithubStoreConfig {
-            email: "rokrassyuk@gmail.com".to_owned(),
-            name: "Roman Krasiuk".to_owned(),
-            owner: "rkrasiuk".to_owned(),
-            repository: "reth-state-snapshots".to_owned(),
-            token: std::env::var("GITHUB_TOKEN").expect("failed to read auth token"),
-            agent: None,
-        })?;
+        let remote =
+            DigitalOceanStore::new("fra1".to_owned(), "reth-state-snapshots".to_owned()).await;
 
         info!(target: "reth::cli", headers_db = %self.headers_db, "Opening headers database");
-        let headers_db =
-            init_headers_db(&self.headers_db, &remote_store, self.chain.clone()).await?;
+        let headers_db = init_headers_db(&self.headers_db, &remote, self.chain.clone()).await?;
         info!(target: "reth::cli", "Headers database opened");
 
-        let (consensus, _forkchoice_state_tx) = self.init_consensus()?;
+        let (consensus, _forkchoice_state_tx) =
+            BeaconConsensus::builder().build(self.chain.clone());
         info!(target: "reth::cli", "Consensus engine initialized");
 
         self.init_trusted_nodes(&mut config);
@@ -113,18 +95,20 @@ impl Command {
             network.event_listener().map(Into::into),
         ));
 
-        // TODO:
-        let state_db = init_state_db(&self.state_db, &remote_store, self.chain.clone()).await?;
-        let fetch_client = Arc::new(network.fetch_client().await?);
+        let fetch_client = network.fetch_client().await?;
+        let tip_number = self.fetch_tip(fetch_client.clone(), self.tip).await?;
+
+        let fetch_client = Arc::new(fetch_client);
         let header_downloader = ReverseHeadersDownloaderBuilder::from(config.stages.headers)
             .build(fetch_client.clone(), consensus.clone())
             .into_task_with(&ctx.task_executor);
-
         let body_downloader = BodiesDownloaderBuilder::from(config.stages.bodies)
             .build(fetch_client.clone(), consensus.clone(), Arc::clone(&headers_db))
             .into_task_with(&ctx.task_executor);
 
-        let headers_sync = HeadersSync::new(headers_db, header_downloader, self.tip);
+        let headers_sync = HeadersSync::new(headers_db, header_downloader);
+
+        let state_db = init_state_db(&self.state_db, &remote, self.chain.clone()).await?;
         let state_sync = StateSync::new(state_db, body_downloader, Arc::new(self.chain.clone()));
 
         // Run sync
@@ -136,7 +120,8 @@ impl Command {
                 self.headers_db.as_ref(),
                 state_sync,
                 self.state_db.as_ref(),
-                remote_store,
+                (tip_number, self.tip),
+                remote,
             )
             .await;
             let _ = rx.send(res);
@@ -162,19 +147,6 @@ impl Command {
                 config.peers.trusted_nodes.insert(*peer);
             });
         }
-    }
-
-    fn init_consensus(&self) -> eyre::Result<(Arc<dyn Consensus>, watch::Sender<ForkchoiceState>)> {
-        let (consensus, notifier) = BeaconConsensus::builder().build(self.chain.clone());
-
-        debug!(target: "reth::cli", tip = %self.tip, "Tip manually set");
-        notifier.send(ForkchoiceState {
-            head_block_hash: self.tip,
-            safe_block_hash: self.tip,
-            finalized_block_hash: self.tip,
-        })?;
-
-        Ok((consensus, notifier))
     }
 
     /// Spawns the configured network and associated tasks and returns the [NetworkHandle] connected
@@ -220,6 +192,25 @@ impl Command {
             .with_task_executor(Box::new(executor))
             .set_head(head)
             .build(ShareableDatabase::new(db, self.chain.clone()))
+    }
+
+    async fn fetch_tip(
+        &self,
+        fetch_client: FetchClient,
+        tip: H256,
+    ) -> Result<u64, reth_interfaces::Error> {
+        info!(target: "reth::cli", ?tip, "Fetching tip block number from the network.");
+        loop {
+            match get_single_header(fetch_client.clone(), BlockHashOrNumber::Hash(tip)).await {
+                Ok(tip_header) => {
+                    info!(target: "reth::cli", ?tip, number = tip_header.number, "Successfully fetched tip block number");
+                    return Ok(tip_header.number)
+                }
+                Err(error) => {
+                    error!(target: "reth::cli", %error, "Failed to fetch the tip. Retrying...");
+                }
+            }
+        }
     }
 }
 
