@@ -1,3 +1,4 @@
+use crate::database::provider::LatestSplitStateProvider;
 use futures::TryStreamExt;
 use rayon::prelude::*;
 use reth_db::{
@@ -11,12 +12,9 @@ use reth_interfaces::p2p::bodies::{downloader::BodyDownloader, response::BlockRe
 use reth_primitives::{
     Address, BlockNumber, ChainSpec, Hardfork, SealedBlock, StorageEntry, H256, U256,
 };
-use reth_provider::LatestStateProviderRef;
 use reth_revm::database::{State, SubState};
 use reth_stages::stages::EXECUTION;
 use std::{ops::Range, sync::Arc};
-
-use crate::database::provider::LatestSplitStateProvider;
 
 pub struct StateSync<DB, B> {
     state_db: DB,
@@ -41,7 +39,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
         }
 
         let mut td = U256::ZERO;
-        let tx = self.state_db.tx()?;
+        let tx = self.headers_db.tx()?;
         for entry in tx.cursor_read::<tables::Headers>()?.walk_range(..=block)? {
             let (_, header) = entry?;
             td += header.difficulty;
