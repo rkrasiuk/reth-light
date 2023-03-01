@@ -4,11 +4,12 @@ use aws_sdk_s3::{
     model::{Object, ObjectCannedAcl},
     Client, Region as AwsRegion,
 };
-use flate2::{
-    write::{GzDecoder, GzEncoder},
-    Compression,
-};
-use std::io::Write;
+use aws_smithy_http::byte_stream::ByteStream;
+use filepath::FilePath;
+use flate2::write::GzDecoder;
+use std::{io::Write, path::Path};
+
+use crate::compression::compress_file;
 
 pub struct DigitalOceanStore {
     bucket: String,
@@ -53,19 +54,18 @@ impl DigitalOceanStore {
         }
     }
 
-    pub async fn save(&self, path: &str, content: &[u8]) -> eyre::Result<()> {
+    pub async fn save(&self, path: &str, content_path: &Path) -> eyre::Result<()> {
         tracing::trace!(target: "remote::digitalocean", path, "Compressing contents");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(content)?;
-        let compressed = encoder.finish()?;
+        let compressed = compress_file(content_path)?;
 
         tracing::trace!(target: "remote::digitalocean", path, "Putting object");
+        let body = ByteStream::from_path(compressed.path()?).await?;
         let _ = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(path)
-            .body(compressed.into())
+            .body(body)
             .acl(ObjectCannedAcl::Private)
             .send()
             .await?;

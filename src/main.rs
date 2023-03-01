@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod compression;
 pub mod database;
 pub mod remote;
 pub mod sync;
