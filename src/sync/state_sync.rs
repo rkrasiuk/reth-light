@@ -52,13 +52,15 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
     }
 
     pub async fn run(&mut self, range: Range<BlockNumber>) -> eyre::Result<()> {
-        tracing::trace!(target: "sync::state", ?range, "Downloading bodies");
+        tracing::trace!(target: "sync::state", ?range, "Commencing state sync");
         self.body_downloader.set_download_range(range.clone())?;
 
         let mut latest = range.start;
         let mut td = self.get_td(range.start)?;
+        tracing::trace!(target: "sync::state", ?td, "Total difficulty calculated");
 
         while latest + 1 < range.end {
+            tracing::trace!(target: "sync::state", latest, "Downloading bodies");
             let bodies =
                 self.body_downloader.try_next().await?.ok_or(eyre::eyre!("channel closed"))?;
             tracing::trace!(target: "sync::state", len = bodies.len(), "Downloaded bodies");
@@ -93,10 +95,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
             std::thread::scope(|scope| {
                 let handle = std::thread::Builder::new()
                     .stack_size(50 * 1024 * 1024)
-                    .spawn_scoped(scope, || {
-                        // execute and store output to results
-                        self.execute_inner(latest, blocks)
-                    })
+                    .spawn_scoped(scope, || self.execute_inner(latest, blocks))
                     .expect("Expects that thread name is not null");
                 handle.join().expect("Expects for thread to not panic")
             })?;
