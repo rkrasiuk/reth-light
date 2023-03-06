@@ -36,17 +36,9 @@ use tracing::*;
 
 use super::dirs::BodiesDbPath;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
-enum SyncEnum {
-    Headers,
-    State,
-}
-
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct Command {
-    // #[arg(value_enum)]
-    // sync: SyncEnum,
     #[arg(long, value_name = "FILE", verbatim_doc_comment, default_value_t)]
     config: PlatformPath<ConfigPath>,
 

@@ -51,10 +51,10 @@ pub async fn run_sync_with_snapshots<'a, DB: Database, H: HeaderDownloader, B: B
     let last_bodies_progress = bodies_sync.get_progress()?;
     bodies_sync.run(tip.clone()).await?;
 
-    let new_bodies_progress = bodies_sync.get_progress()?;
-    if new_bodies_progress > last_bodies_progress {
-        save_single_snapshot(&remote, BODIES_PREFIX, &db.bodies_path, new_bodies_progress).await?;
-    }
+    // let new_bodies_progress = bodies_sync.get_progress()?;
+    // if new_bodies_progress > last_bodies_progress {
+    //     save_single_snapshot(&remote, BODIES_PREFIX, &db.bodies_path,
+    // new_bodies_progress).await?; }
 
     let snapshot_interval = 100_000;
     let mut sync_from = state_sync.get_progress()? + 1;
