@@ -11,7 +11,8 @@ pub const HEADERS_TABLES: [(TableType, &str); 3] = [
 ];
 
 pub const BODIES_PREFIX: &str = "bodies-";
-pub const BODIES_TABLES: [(TableType, &str); 4] = [
+pub const BODIES_TABLES: [(TableType, &str); 5] = [
+    (TableType::Table, tables::SyncStage::const_name()),
     (TableType::Table, tables::BlockBodies::const_name()),
     (TableType::Table, tables::Transactions::const_name()),
     (TableType::Table, tables::BlockOmmers::const_name()),

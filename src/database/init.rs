@@ -39,7 +39,7 @@ impl DatabaseInitializer {
         let local = self.initialize_database(descriptor.default_tables())?;
         // Get database progress.
         let progress = descriptor.progress(Arc::clone(&local))?.unwrap_or_default();
-        //
+        // Restore database if remote has more data.
         let db = self.restore_database(local, remote, progress).await?;
         descriptor.ensure_genesis(Arc::clone(&db), chain_spec)?;
         Ok(db)
