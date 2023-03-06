@@ -1,7 +1,7 @@
 use futures::TryStreamExt;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
-    database::Database,
+    database::{Database, DatabaseGAT},
     models::{StoredBlockBody, StoredBlockOmmers, StoredBlockWithdrawals},
     tables,
     transaction::{DbTx, DbTxMut},
@@ -50,63 +50,74 @@ impl<DB: Database, B: BodyDownloader> BodiesSync<DB, B> {
 
         while latest_block_number < tip.number {
             let bodies = self.downloader.try_next().await?.ok_or(eyre::eyre!("channel closed"))?;
-            let last_body = self.get_last_body()?;
-            let mut current_tx_id = last_body.start_tx_id + last_body.tx_count;
 
             let tx = self.db.tx_mut()?;
-            let mut body_cursor = tx.cursor_write::<tables::BlockBodies>()?;
-            let mut tx_cursor = tx.cursor_write::<tables::Transactions>()?;
-            let mut ommers_cursor = tx.cursor_write::<tables::BlockOmmers>()?;
-            let mut withdrawals_cursor = tx.cursor_write::<tables::BlockWithdrawals>()?;
-
-            let range =
-                bodies.first().unwrap().block_number()..=bodies.last().unwrap().block_number();
-            tracing::trace!(target: "sync::bodies", ?range, "Inserting bodies");
-
-            for response in bodies {
-                let block_number = response.block_number();
-                latest_block_number = block_number;
-
-                match response {
-                    BlockResponse::Full(block) => {
-                        let body = StoredBlockBody {
-                            start_tx_id: current_tx_id,
-                            tx_count: block.body.len() as u64,
-                        };
-                        body_cursor.append(block_number, body)?;
-
-                        for transaction in block.body {
-                            tx_cursor.append(current_tx_id, transaction)?;
-                            current_tx_id += 1;
-                        }
-
-                        if !block.ommers.is_empty() {
-                            let ommers =
-                                block.ommers.into_iter().map(SealedHeader::unseal).collect();
-                            ommers_cursor.append(block_number, StoredBlockOmmers { ommers })?;
-                        }
-
-                        if let Some(withdrawals) = block.withdrawals {
-                            if !withdrawals.is_empty() {
-                                withdrawals_cursor
-                                    .append(block_number, StoredBlockWithdrawals { withdrawals })?;
-                            }
-                        }
-                    }
-                    BlockResponse::Empty(_) => {
-                        body_cursor.append(
-                            block_number,
-                            StoredBlockBody { start_tx_id: current_tx_id, tx_count: 0 },
-                        )?;
-                    }
-                };
-            }
-
-            tracing::trace!(target: "sync::bodies", progress = latest_block_number, "Progress updated");
-            BODIES.save_progress(&tx, latest_block_number)?;
+            latest_block_number = self.insert_bodies(&tx, bodies)?;
+            tx.commit()?;
         }
 
         tracing::trace!(target: "sync::bodies", progress = latest_block_number, "Finished syncing");
         Ok(())
+    }
+
+    fn insert_bodies<'a>(
+        &self,
+        tx: &<DB as DatabaseGAT<'a>>::TXMut,
+        bodies: Vec<BlockResponse>,
+    ) -> eyre::Result<BlockNumber> {
+        let last_body = self.get_last_body()?;
+        let mut current_tx_id = last_body.start_tx_id + last_body.tx_count;
+
+        let mut body_cursor = tx.cursor_write::<tables::BlockBodies>()?;
+        let mut tx_cursor = tx.cursor_write::<tables::Transactions>()?;
+        let mut ommers_cursor = tx.cursor_write::<tables::BlockOmmers>()?;
+        let mut withdrawals_cursor = tx.cursor_write::<tables::BlockWithdrawals>()?;
+
+        let range = bodies.first().unwrap().block_number()..=bodies.last().unwrap().block_number();
+        tracing::trace!(target: "sync::bodies", ?range, "Inserting bodies");
+
+        let mut latest = None;
+        for response in bodies {
+            let block_number = response.block_number();
+            latest = Some(block_number);
+
+            match response {
+                BlockResponse::Full(block) => {
+                    let body = StoredBlockBody {
+                        start_tx_id: current_tx_id,
+                        tx_count: block.body.len() as u64,
+                    };
+                    body_cursor.append(block_number, body)?;
+
+                    for transaction in block.body {
+                        tx_cursor.append(current_tx_id, transaction)?;
+                        current_tx_id += 1;
+                    }
+
+                    if !block.ommers.is_empty() {
+                        let ommers = block.ommers.into_iter().map(SealedHeader::unseal).collect();
+                        ommers_cursor.append(block_number, StoredBlockOmmers { ommers })?;
+                    }
+
+                    if let Some(withdrawals) = block.withdrawals {
+                        if !withdrawals.is_empty() {
+                            withdrawals_cursor
+                                .append(block_number, StoredBlockWithdrawals { withdrawals })?;
+                        }
+                    }
+                }
+                BlockResponse::Empty(_) => {
+                    body_cursor.append(
+                        block_number,
+                        StoredBlockBody { start_tx_id: current_tx_id, tx_count: 0 },
+                    )?;
+                }
+            };
+        }
+
+        let progress = latest.unwrap();
+        tracing::trace!(target: "sync::bodies", progress, "Progress updated");
+        BODIES.save_progress(tx, progress)?;
+        Ok(progress)
     }
 }
