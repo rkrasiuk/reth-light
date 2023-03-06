@@ -136,9 +136,9 @@ impl Command {
         let headers_sync = HeadersSync::new(db.headers(), header_downloader);
         let bodies_sync = BodiesSync::new(db.bodies(), body_downloader);
         let state_sync = StateSync::new(
-            db.state(),
-            db.bodies(),
             db.headers(),
+            db.bodies(),
+            db.state(),
             config.stages.execution.commit_threshold,
             self.chain.clone(),
         );
