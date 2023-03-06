@@ -48,7 +48,8 @@ impl<DB: Database, B: BodyDownloader> BodiesSync<DB, B> {
         self.downloader.set_download_range(start_block..tip.number + 1)?;
         tracing::trace!(target: "sync::bodies", progress = progress, "Commencing sync");
 
-        while let Some(bodies) = self.downloader.try_next().await? {
+        while latest_block_number < tip.number {
+            let bodies = self.downloader.try_next().await?.ok_or(eyre::eyre!("channel closed"))?;
             let last_body = self.get_last_body()?;
             let mut current_tx_id = last_body.start_tx_id + last_body.tx_count;
 
