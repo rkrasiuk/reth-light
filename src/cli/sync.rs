@@ -1,8 +1,11 @@
 use crate::{
     cli::dirs::{HeadersDbPath, StateDbPath},
-    database::{init_headers_db, init_state_db, split::SplitDatabase},
-    remote::digitalocean::store::DigitalOceanStore,
-    sync::{run_sync_with_snapshots, HeadersSync, StateSync, Tip},
+    database::{
+        BodiesDescriptor, DatabaseInitializer, HeadersDescriptor, SplitDatabase, StateDescriptor,
+        BODIES_PREFIX, HEADERS_PREFIX, STATE_PREFIX,
+    },
+    remote::RemoteStore,
+    sync::{run_sync_with_snapshots, BodiesSync, HeadersSync, StateSync, Tip},
 };
 use clap::{crate_version, Parser, ValueEnum};
 use eyre::Context;
@@ -16,7 +19,6 @@ use reth::{
     utils::get_single_header,
 };
 use reth_consensus::beacon::BeaconConsensus;
-use reth_db::mdbx::{Env, WriteMap};
 use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
@@ -26,11 +28,13 @@ use reth_network::{
 };
 use reth_network_api::NetworkInfo;
 use reth_primitives::{BlockHashOrNumber, ChainSpec, Head, H256};
-use reth_provider::{BlockProvider, HeaderProvider, ShareableDatabase};
+use reth_provider::{test_utils::NoopProvider, BlockProvider, HeaderProvider};
 use reth_staged_sync::{utils::chainspec::genesis_value_parser, Config};
 use reth_tasks::TaskExecutor;
 use std::{path::PathBuf, sync::Arc};
 use tracing::*;
+
+use super::dirs::BodiesDbPath;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
 enum SyncEnum {
@@ -48,6 +52,9 @@ pub struct Command {
 
     #[arg(long, value_name = "PATH", verbatim_doc_comment, default_value_t)]
     headers_db: PlatformPath<HeadersDbPath>,
+
+    #[arg(long, value_name = "PATH", verbatim_doc_comment, default_value_t)]
+    bodies_db: PlatformPath<BodiesDbPath>,
 
     #[arg(long, value_name = "PATH", verbatim_doc_comment, default_value_t)]
     state_db: PlatformPath<StateDbPath>,
@@ -79,12 +86,7 @@ impl Command {
         let mut config: Config = self.load_config()?;
         info!(target: "reth::cli", path = %self.config, "Configuration loaded");
 
-        let remote =
-            DigitalOceanStore::new("fra1".to_owned(), "reth-state-snapshots".to_owned()).await;
-
-        info!(target: "reth::cli", headers_db = %self.headers_db, "Opening split database");
-        let headers_db = init_headers_db(&self.headers_db, &remote, self.chain.clone()).await?;
-        info!(target: "reth::cli", "Split database opened");
+        let remote = RemoteStore::new("fra1".to_owned(), "reth-state-snapshots".to_owned()).await;
 
         let (consensus, _forkchoice_state_tx) =
             BeaconConsensus::builder().build(self.chain.clone());
@@ -93,8 +95,7 @@ impl Command {
         self.init_trusted_nodes(&mut config);
 
         info!(target: "reth::cli", "Connecting to P2P network");
-        let network_config =
-            self.load_network_config(&config, headers_db.clone(), ctx.task_executor.clone());
+        let network_config = self.load_network_config(&config, ctx.task_executor.clone());
         let network = self.start_network(network_config, &ctx.task_executor, ()).await?;
         info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), "Connected to P2P network");
 
@@ -106,12 +107,31 @@ impl Command {
         let fetch_client = network.fetch_client().await?;
         let tip = Tip::new(self.tip, self.fetch_tip(fetch_client.clone(), self.tip).await?);
 
+        info!(target: "reth::cli", headers_db = %self.headers_db, "Opening split database");
+        let headers = DatabaseInitializer::default()
+            .with_path(&self.headers_db)
+            .with_prefix(HEADERS_PREFIX)
+            .init(&remote, self.chain.clone(), HeadersDescriptor)
+            .await?;
+        let bodies = DatabaseInitializer::default()
+            .with_path(&self.bodies_db)
+            .with_prefix(BODIES_PREFIX)
+            .init(&remote, self.chain.clone(), BodiesDescriptor)
+            .await?;
+        let state = DatabaseInitializer::default()
+            .with_path(&self.state_db)
+            .with_prefix(STATE_PREFIX)
+            .init(&remote, self.chain.clone(), StateDescriptor)
+            .await?;
         let db = SplitDatabase::new(
             &self.headers_db,
-            headers_db,
+            headers,
+            self.bodies_db,
+            bodies,
             &self.state_db,
-            init_state_db(&self.state_db, &remote, self.chain.clone(), tip).await?,
+            state,
         );
+        info!(target: "reth::cli", "Split database opened");
 
         let fetch_client = Arc::new(fetch_client);
         let header_downloader = ReverseHeadersDownloaderBuilder::from(config.stages.headers)
@@ -122,15 +142,22 @@ impl Command {
             .into_task_with(&ctx.task_executor);
 
         let headers_sync = HeadersSync::new(db.headers(), header_downloader);
-
-        let state_sync =
-            StateSync::new(db.state(), db.headers(), body_downloader, Arc::new(self.chain.clone()));
+        let bodies_sync = BodiesSync::new(db.bodies(), body_downloader);
+        let state_sync = StateSync::new(
+            db.state(),
+            db.bodies(),
+            db.headers(),
+            config.stages.execution.commit_threshold,
+            self.chain.clone(),
+        );
 
         // Run sync
         let (rx, tx) = tokio::sync::oneshot::channel();
         info!(target: "reth::cli", "Starting state sync");
         ctx.task_executor.spawn_critical_blocking("state sync task", async move {
-            let res = run_sync_with_snapshots(headers_sync, state_sync, tip, remote, db).await;
+            let res =
+                run_sync_with_snapshots(headers_sync, bodies_sync, state_sync, tip, remote, db)
+                    .await;
             let _ = rx.send(res);
         });
 
@@ -184,9 +211,8 @@ impl Command {
     fn load_network_config(
         &self,
         config: &Config,
-        db: Arc<Env<WriteMap>>,
         executor: TaskExecutor,
-    ) -> NetworkConfig<ShareableDatabase<Arc<Env<WriteMap>>>> {
+    ) -> NetworkConfig<NoopProvider> {
         let head = Head {
             number: 0,
             hash: self.chain.genesis_hash(),
@@ -198,7 +224,7 @@ impl Command {
             .network_config(config, self.chain.clone())
             .with_task_executor(Box::new(executor))
             .set_head(head)
-            .build(ShareableDatabase::new(db, self.chain.clone()))
+            .build(NoopProvider::default())
     }
 
     async fn fetch_tip(

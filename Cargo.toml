@@ -7,21 +7,21 @@ edition = "2021"
 
 [dependencies]
 # reth
-reth = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-db = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods", features = ["mdbx"] }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-staged-sync = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-stages = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-interfaces = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-network = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-network-api = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-downloaders = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
-reth-executor = { git = "https://github.com/paradigmxyz/reth", branch = "rkrasiuk/expose-node-methods" }
+reth = { git = "https://github.com/paradigmxyz/reth" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", features = ["mdbx"] }
+reth-provider = { git = "https://github.com/paradigmxyz/reth" }
+reth-staged-sync = { git = "https://github.com/paradigmxyz/reth" }
+reth-stages = { git = "https://github.com/paradigmxyz/reth" }
+reth-interfaces = { git = "https://github.com/paradigmxyz/reth" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth" }
+reth-network = { git = "https://github.com/paradigmxyz/reth" }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth" }
+reth-downloaders = { git = "https://github.com/paradigmxyz/reth" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth" }
+reth-executor = { git = "https://github.com/paradigmxyz/reth" }
 
 # tracing
 tracing = "0.1"
@@ -36,7 +36,7 @@ tempfile = "3.4.0"
 bytes = "1.4"
 
 # cli
-clap = { git = "https://github.com/rkrasiuk/clap", branch = "rkrasiuk/fix-almost-swapped-lint", features = ["derive", "cargo"] }
+clap = { version = "4", features = ["derive", "cargo"] }
 dotenv = "0.15.0"
 
 # aws

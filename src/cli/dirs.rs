@@ -11,6 +11,15 @@ impl XdgPath for HeadersDbPath {
 }
 
 #[derive(Default, Debug, Clone)]
+pub struct BodiesDbPath;
+
+impl XdgPath for BodiesDbPath {
+    fn resolve() -> Option<PathBuf> {
+        data_dir().map(|root| root.join("bodies-db"))
+    }
+}
+
+#[derive(Default, Debug, Clone)]
 pub struct StateDbPath;
 
 impl XdgPath for StateDbPath {

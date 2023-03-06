@@ -1,5 +1,4 @@
-use crate::database::provider::LatestSplitStateProvider;
-use futures::TryStreamExt;
+use crate::database::LatestSplitStateProvider;
 use rayon::prelude::*;
 use reth_db::{
     cursor::DbCursorRO,
@@ -7,35 +6,44 @@ use reth_db::{
     tables,
     transaction::{DbTx, DbTxMut},
 };
-use reth_executor::execution_result::{AccountChangeSet, AccountInfoChangeSet, ExecutionResult};
-use reth_interfaces::p2p::bodies::{downloader::BodyDownloader, response::BlockResponse};
-use reth_primitives::{
-    Address, BlockNumber, ChainSpec, Hardfork, SealedBlock, StorageEntry, H256, U256,
+use reth_executor::{
+    execution_result::{AccountChangeSet, AccountInfoChangeSet, ExecutionResult},
+    executor::Executor,
 };
+use reth_primitives::{Address, Block, BlockNumber, ChainSpec, Hardfork, StorageEntry, H256, U256};
+use reth_provider::{test_utils::NoopProvider, ProviderError};
 use reth_revm::database::{State, SubState};
 use reth_stages::stages::EXECUTION;
-use std::{ops::Range, sync::Arc};
+use std::ops::RangeInclusive;
 
-pub struct StateSync<DB, B> {
-    state_db: DB,
+pub struct StateSync<'a, DB> {
     headers_db: DB,
-    body_downloader: B,
-    chain_spec: Arc<ChainSpec>,
+    bodies_db: DB,
+    state_db: DB,
+    commit_threshold: u64,
+    executor: Executor<'a, NoopProvider>,
 }
 
-impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
+impl<'a, DB: Database> StateSync<'a, DB> {
     pub fn new(
-        state_db: DB,
         headers_db: DB,
-        body_downloader: B,
-        chain_spec: Arc<ChainSpec>,
+        bodies_db: DB,
+        state_db: DB,
+        commit_threshold: u64,
+        chain_spec: ChainSpec,
     ) -> Self {
-        Self { state_db, headers_db, body_downloader, chain_spec }
+        Self {
+            headers_db,
+            bodies_db,
+            state_db,
+            commit_threshold,
+            executor: Executor::from(chain_spec),
+        }
     }
 
     pub fn get_td(&self, block: BlockNumber) -> eyre::Result<U256> {
         if block == 0 {
-            return Ok(self.chain_spec.genesis.difficulty)
+            return Ok(self.executor.chain_spec.genesis.difficulty)
         }
 
         let mut td = U256::ZERO;
@@ -51,102 +59,119 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
         Ok(EXECUTION.get_progress(&self.state_db.tx()?)?.unwrap_or_default())
     }
 
-    pub async fn run(&mut self, range: Range<BlockNumber>) -> eyre::Result<()> {
+    pub async fn run(&mut self, range: RangeInclusive<BlockNumber>) -> eyre::Result<()> {
         tracing::trace!(target: "sync::state", ?range, "Commencing state sync");
-        self.body_downloader.set_download_range(range.clone())?;
 
-        let mut latest = range.start;
-        let mut td = self.get_td(range.start)?;
-        tracing::trace!(target: "sync::state", ?td, "Total difficulty calculated");
+        let mut td = self.get_td(*range.start())?; // TODO:
+        tracing::trace!(target: "sync::state", td = td.to_string(), "Total difficulty calculated");
 
-        while latest + 1 < range.end {
-            tracing::trace!(target: "sync::state", latest, "Downloading bodies");
-            let bodies =
-                self.body_downloader.try_next().await?.ok_or(eyre::eyre!("channel closed"))?;
-            tracing::trace!(target: "sync::state", len = bodies.len(), "Downloaded bodies");
-            let blocks = bodies
-                .into_iter()
-                .map(|body| -> eyre::Result<_> {
-                    td += body.header().difficulty;
-                    let block = match body {
-                        BlockResponse::Empty(header) => {
-                            SealedBlock { header, ..Default::default() }
-                        }
-                        BlockResponse::Full(block) => block,
-                    };
-                    let senders = block
-                        .body
-                        .par_iter()
-                        .map(|transaction| {
-                            transaction.recover_signer().ok_or(eyre::eyre!(
-                                "failed to recover sender for tx {}",
-                                transaction.hash
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok((block, senders, td.clone()))
-                })
-                .collect::<eyre::Result<Vec<_>>>()?;
-
-            let (start, end) = (blocks.first().unwrap().0.number, blocks.last().unwrap().0.number);
-            latest = end;
-            tracing::trace!(target: "sync::state", start, end, "Executing blocks");
-
+        let mut progress = self.get_progress()?;
+        while progress < *range.end() {
+            let start = progress + 1;
+            let range = start..=range.end().clone().min(start + self.commit_threshold);
             std::thread::scope(|scope| {
                 let handle = std::thread::Builder::new()
                     .stack_size(50 * 1024 * 1024)
-                    .spawn_scoped(scope, || self.execute_inner(latest, blocks))
+                    .spawn_scoped(scope, || self.execute_inner(range, &mut td))
                     .expect("Expects that thread name is not null");
                 handle.join().expect("Expects for thread to not panic")
             })?;
+            progress = self.get_progress()?;
         }
 
         Ok(())
     }
 
-    fn execute_inner(
-        &self,
-        latest: BlockNumber,
-        blocks: Vec<(SealedBlock, Vec<Address>, U256)>,
-    ) -> eyre::Result<()> {
-        let tx = self.state_db.tx_mut()?;
+    fn execute_inner(&self, range: RangeInclusive<BlockNumber>, td: &mut U256) -> eyre::Result<()> {
         let headers_tx = self.headers_db.tx_mut()?;
+        let bodies_tx = self.bodies_db.tx()?;
+        let tx = self.state_db.tx_mut()?;
+
+        tracing::trace!(target: "sync::state", ?range, "Retrieving bodies");
+        let mut headers_cursor = headers_tx.cursor_read::<tables::Headers>()?;
+        let mut bodies_cursor = bodies_tx.cursor_read::<tables::BlockBodies>()?;
+        let mut ommers_cursor = bodies_tx.cursor_read::<tables::BlockOmmers>()?;
+        let mut withdrawals_cursor = bodies_tx.cursor_read::<tables::BlockWithdrawals>()?;
+        let mut tx_cursor = bodies_tx.cursor_read::<tables::Transactions>()?;
+
+        let block_batch = headers_cursor
+            .walk_range(range.clone())?
+            .map(|entry| -> Result<_, eyre::Error> {
+                let (number, header) = entry?;
+                *td += header.difficulty;
+                let (_, body) =
+                    bodies_cursor.seek_exact(number)?.ok_or(ProviderError::BlockBody { number })?;
+                let (_, stored_ommers) = ommers_cursor.seek_exact(number)?.unwrap_or_default();
+                let withdrawals =
+                    withdrawals_cursor.seek_exact(number)?.map(|(_, w)| w.withdrawals);
+                Ok((header, td.clone(), body, stored_ommers.ommers, withdrawals))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let mut state_provider =
             SubState::new(State::new(LatestSplitStateProvider::new(&headers_tx, &tx)));
-        let mut changesets = Vec::with_capacity(blocks.len());
-        for (block, senders, td) in blocks {
-            let block_number = block.number;
-            let changeset = reth_executor::executor::execute_and_verify_receipt(
-                &block.unseal(),
-                td,
-                Some(senders),
-                &self.chain_spec,
-                &mut state_provider,
-            )
-            .map_err(|error| eyre::eyre!("Execution error at block #{block_number}: {error:?}"))?;
+        let mut changesets = Vec::with_capacity(block_batch.len());
+        for (header, td, body, ommers, withdrawals) in block_batch {
+            let block_number = header.number;
+
+            let mut tx_walker = tx_cursor.walk(Some(body.start_tx_id))?;
+            let mut transactions = Vec::with_capacity(body.tx_count as usize);
+            // get next N transactions.
+            for index in body.tx_id_range() {
+                let (tx_index, tx) =
+                    tx_walker.next().ok_or(ProviderError::EndOfTransactionTable)??;
+                if tx_index != index {
+                    tracing::error!(target: "sync::stages::execution", block = header.number, expected = index, found = tx_index, ?body, "Transaction gap");
+                    return Err(ProviderError::TransactionsGap { missing: tx_index }.into())
+                }
+                transactions.push(tx);
+            }
+
+            let senders = transactions
+                .par_iter()
+                .map(|transaction| {
+                    transaction
+                        .recover_signer()
+                        .ok_or(eyre::eyre!("failed to recover sender for tx {}", transaction.hash))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut executor = self.executor.with_db(&mut state_provider);
+            let changeset = executor
+                .execute_and_verify_receipt(
+                    &Block { header, body: transactions, ommers, withdrawals },
+                    td,
+                    Some(senders),
+                )
+                .map_err(|error| {
+                    eyre::eyre!("Execution error at block #{block_number}: {error:?}")
+                })?;
             changesets.push((block_number, changeset));
         }
-        tracing::trace!(target: "sync::state", latest, "Executed blocks");
+        tracing::trace!(target: "sync::state", ?range, "Executed blocks");
 
         // apply changes to plain database.
+        let mut latest = None;
         for (block_number, result) in changesets.into_iter() {
+            latest = Some(block_number);
             self.apply_state_changes(&tx, block_number, result)?;
         }
 
+        let latest = latest.unwrap();
         EXECUTION.save_progress(&tx, latest)?;
         tx.commit()?;
         tracing::trace!(target: "sync::state", progress = latest, "Plain state updated");
         Ok(())
     }
 
-    fn apply_state_changes<'a, Tx: DbTxMut<'a>>(
+    fn apply_state_changes<'tx, Tx: DbTxMut<'tx>>(
         &self,
         tx: &Tx,
         block: BlockNumber,
         result: ExecutionResult,
     ) -> eyre::Result<()> {
         let spurious_dragon_active =
-            self.chain_spec.fork(Hardfork::SpuriousDragon).active_at_block(block);
+            self.executor.chain_spec.fork(Hardfork::SpuriousDragon).active_at_block(block);
 
         for result in result.tx_changesets.into_iter() {
             for (address, account_change_set) in result.changeset.into_iter() {
@@ -200,7 +225,7 @@ impl<DB: Database, B: BodyDownloader> StateSync<DB, B> {
     }
 
     /// Apply the changes from the changeset to a database transaction.
-    fn apply_account_changeset<'a, Tx: DbTxMut<'a>>(
+    fn apply_account_changeset<'tx, Tx: DbTxMut<'tx>>(
         &self,
         tx: &Tx,
         changeset: AccountInfoChangeSet,

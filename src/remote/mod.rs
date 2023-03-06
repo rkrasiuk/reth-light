@@ -1,2 +1,3 @@
-pub mod digitalocean;
-pub mod github;
+
+mod digitalocean;
+pub use digitalocean::store::RemoteStore;

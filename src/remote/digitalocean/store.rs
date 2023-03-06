@@ -10,12 +10,12 @@ use std::{io::Write, path::Path};
 
 use crate::compression::compress_file;
 
-pub struct DigitalOceanStore {
+pub struct RemoteStore {
     bucket: String,
     client: Client,
 }
 
-impl DigitalOceanStore {
+impl RemoteStore {
     pub async fn new(region: String, bucket: String) -> Self {
         let endpoint = format!("https://{region}.digitaloceanspaces.com");
         Self {
